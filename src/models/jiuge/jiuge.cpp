@@ -8,6 +8,9 @@
 #include <random>
 #include <thread>
 #include <vector>
+#include <limits>
+#include <cmath>
+#include <algorithm>
 
 void createDeviceResource(DeviceResource *rsrc, const JiugeMeta *meta,
                           const JiugeWeights *weights,
@@ -117,6 +120,17 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                       struct KVCache **kv_caches,
                       const float *temperature, const uint32_t *topk, const float *topp,
                       uint32_t *output) {
+    inferDeviceBatchWithLogprobs(meta, rsrc, idev, ndev, tokens, ntok, req_lens, nreq, req_pos,
+                                 kv_caches, temperature, topk, topp, output, nullptr);
+}
+
+void inferDeviceBatchWithLogprobs(const JiugeMeta &meta, DeviceResource &rsrc,
+                                   uint32_t idev, uint32_t ndev,
+                                   const uint32_t *tokens, uint32_t ntok,
+                                   const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                                   struct KVCache **kv_caches,
+                                   const float *temperature, const uint32_t *topk, const float *topp,
+                                   uint32_t *output, float *logprobs_out) {
     auto nlayer = meta.nlayer;
     auto nkvh = meta.nkvh / ndev;
     auto nh = meta.nh / ndev;
@@ -443,10 +457,157 @@ void inferDeviceBatch(const JiugeMeta &meta, DeviceResource &rsrc,
                 logits_in->data((token_offset - 1) * d),
                 rsrc.w_out_norm->data(), stream));
         }
+        // Debug: Check hidden states before final GEMM
+        RUN_INFINI(infinirtStreamSynchronize(stream));
+        std::vector<float> hidden_states_cpu(nreq * d);
+        RUN_INFINI(infinirtMemcpy(hidden_states_cpu.data(), logits_out->data(),
+                                  sizeof(float) * nreq * d, INFINIRT_MEMCPY_D2H));
+        
+        if (nreq > 0 && d > 0) {
+            float min_hidden = hidden_states_cpu[0], max_hidden = hidden_states_cpu[0];
+            int finite_count = 0, inf_count = 0, nan_count = 0;
+            for (uint32_t i = 0; i < std::min(static_cast<uint32_t>(nreq * d), 1000u); i++) {
+                float val = hidden_states_cpu[i];
+                if (std::isfinite(val)) {
+                    finite_count++;
+                    min_hidden = std::min(min_hidden, val);
+                    max_hidden = std::max(max_hidden, val);
+                } else if (std::isinf(val)) {
+                    inf_count++;
+                } else {
+                    nan_count++;
+                }
+            }
+            printf("[DEBUG] Hidden states before final GEMM: min=%.6f, max=%.6f, finite=%d, inf=%d, nan=%d\n", 
+                   min_hidden, max_hidden, finite_count, inf_count, nan_count);
+        }
+        
         RUN_INFINI(infiniopGemm(
             desc_out_embd, workspace, workspace_size,
             prob_buf->data(), logits_out->data(),
             rsrc.w_out_embd->data(), 1.0, 0.0, stream));
+            
+        // Debug: Check logits immediately after GEMM
+        RUN_INFINI(infinirtStreamSynchronize(stream));
+        std::vector<float> logits_after_gemm(nreq * dvoc);
+        RUN_INFINI(infinirtMemcpy(logits_after_gemm.data(), prob_buf->data(),
+                                  sizeof(float) * nreq * dvoc, INFINIRT_MEMCPY_D2H));
+        
+        if (nreq > 0 && dvoc > 0) {
+            float min_logit_gemm = logits_after_gemm[0], max_logit_gemm = logits_after_gemm[0];
+            int finite_count_gemm = 0, inf_count_gemm = 0, nan_count_gemm = 0;
+            for (uint32_t i = 0; i < std::min(static_cast<uint32_t>(nreq * dvoc), 1000u); i++) {
+                float val = logits_after_gemm[i];
+                if (std::isfinite(val)) {
+                    finite_count_gemm++;
+                    min_logit_gemm = std::min(min_logit_gemm, val);
+                    max_logit_gemm = std::max(max_logit_gemm, val);
+                } else if (std::isinf(val)) {
+                    inf_count_gemm++;
+                } else {
+                    nan_count_gemm++;
+                }
+            }
+            printf("[DEBUG] Logits after GEMM: min=%.6f, max=%.6f, finite=%d, inf=%d, nan=%d\n", 
+                   min_logit_gemm, max_logit_gemm, finite_count_gemm, inf_count_gemm, nan_count_gemm);
+        }
+        
+        // Copy logprobs if requested
+        if (logprobs_out != nullptr) {
+            RUN_INFINI(infinirtStreamSynchronize(stream));
+            std::vector<float> logits_cpu(nreq * dvoc);
+            RUN_INFINI(infinirtMemcpy(logits_cpu.data(), prob_buf->data(),
+                                      sizeof(float) * nreq * dvoc, INFINIRT_MEMCPY_D2H));
+            
+            // Debug: Check raw logits values
+            if (nreq > 0 && dvoc > 0) {
+                float min_logit = logits_cpu[0], max_logit = logits_cpu[0];
+                int finite_count = 0, inf_count = 0, nan_count = 0;
+                for (uint32_t i = 0; i < std::min(static_cast<uint32_t>(dvoc), 1000u); i++) {
+                    float val = logits_cpu[i];
+                    if (std::isfinite(val)) {
+                        finite_count++;
+                        min_logit = std::min(min_logit, val);
+                        max_logit = std::max(max_logit, val);
+                    } else if (std::isinf(val)) {
+                        inf_count++;
+                    } else {
+                        nan_count++;
+                    }
+                }
+                printf("[DEBUG] Raw logits: min=%.2f, max=%.2f, finite=%d, inf=%d, nan=%d\n", 
+                       min_logit, max_logit, finite_count, inf_count, nan_count);
+            }
+            
+
+            
+            // Apply log_softmax to get log probabilities
+            for (uint32_t req = 0; req < nreq; req++) {
+                float* logits_req = &logits_cpu[req * dvoc];
+                float* logprobs_req = &logprobs_out[req * dvoc];
+                
+                // Only handle invalid values (NaN, INF), preserve natural logits distribution
+                bool has_valid_logits = false;
+                
+                // Only replace non-finite values with safe fallback
+                for (uint32_t i = 0; i < dvoc; i++) {
+                    if (std::isfinite(logits_req[i])) {
+                        has_valid_logits = true;
+                    } else {
+                        // Replace NaN/INF with a very negative but finite value
+                        logits_req[i] = -1000.0f;
+                    }
+                }
+                
+                if (!has_valid_logits) {
+                    // If all logits are invalid, set uniform log probabilities
+                    float uniform_logprob = -logf(static_cast<float>(dvoc));
+                    for (uint32_t i = 0; i < dvoc; i++) {
+                        logprobs_req[i] = uniform_logprob;
+                    }
+                    continue;
+                }
+                
+                // Find max for numerical stability
+                float max_logit = -std::numeric_limits<float>::infinity();
+                for (uint32_t i = 0; i < dvoc; i++) {
+                    if (std::isfinite(logits_req[i])) {
+                        max_logit = std::max(max_logit, logits_req[i]);
+                    }
+                }
+                
+                // Compute log_sum_exp
+                float sum_exp = 0.0f;
+                for (uint32_t i = 0; i < dvoc; i++) {
+                    if (std::isfinite(logits_req[i])) {
+                        sum_exp += expf(logits_req[i] - max_logit);
+                    }
+                }
+                
+                if (sum_exp <= 0.0f || !std::isfinite(sum_exp)) {
+                    // Fallback to uniform distribution
+                    float uniform_logprob = -logf(static_cast<float>(dvoc));
+                    for (uint32_t i = 0; i < dvoc; i++) {
+                        logprobs_req[i] = uniform_logprob;
+                    }
+                    continue;
+                }
+                
+                float log_sum_exp = max_logit + logf(sum_exp);
+                
+
+                
+                // Compute log probabilities
+                for (uint32_t i = 0; i < dvoc; i++) {
+                    if (std::isfinite(logits_req[i])) {
+                        logprobs_req[i] = logits_req[i] - log_sum_exp;
+                    } else {
+                        logprobs_req[i] = -std::numeric_limits<float>::infinity();
+                    }
+                }
+            }
+        }
+        
         std::random_device _rd;
         std::mt19937 gen(_rd());
         token_offset = 0;
@@ -514,6 +675,8 @@ inferBatch(struct JiugeModel *model,
     model->req.temperature = temperature;
     model->req.topk = topk;
     model->req.topp = topp;
+    model->req.logprobs_out = nullptr;
+    model->req.is_logprobs_request = false;
 
     for (size_t idev = 0; idev < model->dev_ids.size(); idev++) {
         std::unique_lock<std::mutex> lock(model->states[idev].mtx);
@@ -549,7 +712,11 @@ void launchDevice(const JiugeMeta &meta, const JiugeWeights *weights, DeviceReso
             break;
         }
 
-        inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok, req.req_lens, req.nreq, req.req_pos, req.kv_caches, req.temperature, req.topk, req.topp, req.output);
+        if (req.is_logprobs_request) {
+            inferDeviceBatchWithLogprobs(meta, *rsrc, idev, ndev, req.tokens, req.ntok, req.req_lens, req.nreq, req.req_pos, req.kv_caches, req.temperature, req.topk, req.topp, req.output, req.logprobs_out);
+        } else {
+            inferDeviceBatch(meta, *rsrc, idev, ndev, req.tokens, req.ntok, req.req_lens, req.nreq, req.req_pos, req.kv_caches, req.temperature, req.topk, req.topp, req.output);
+        }
 
         state.proceed = false;
         lock.unlock();
@@ -610,4 +777,38 @@ __C void destroyJiugeModel(struct JiugeModel *model) {
     }
 
     delete model;
+}
+
+__C void
+inferBatchWithLogprobs(struct JiugeModel *model,
+                       const uint32_t *tokens, uint32_t ntok,
+                       const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                       struct KVCache **kv_caches,
+                       const float *temperature, const uint32_t *topk, const float *topp,
+                       uint32_t *output, float *logprobs_out) {
+    model->req.tokens = tokens;
+    model->req.ntok = ntok;
+    model->req.req_lens = req_lens;
+    model->req.nreq = nreq;
+    model->req.req_pos = req_pos;
+    model->req.kv_caches = kv_caches;
+    model->req.output = output;
+    model->req.temperature = temperature;
+    model->req.topk = topk;
+    model->req.topp = topp;
+    model->req.logprobs_out = logprobs_out;
+    model->req.is_logprobs_request = true;
+
+    for (size_t idev = 0; idev < model->dev_ids.size(); idev++) {
+        std::unique_lock<std::mutex> lock(model->states[idev].mtx);
+        model->states[idev].proceed = true;
+        lock.unlock();
+        model->states[idev].cv_start.notify_one();
+    }
+    for (size_t i = model->dev_ids.size(); i > 0; i--) {
+        auto idev = i - 1;
+        std::unique_lock<std::mutex> lock(model->states[idev].mtx);
+        model->states[idev].cv_done.wait(lock, [&] { return !(model->states[idev].proceed); });
+        lock.unlock();
+    }
 }

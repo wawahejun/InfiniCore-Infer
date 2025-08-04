@@ -38,7 +38,7 @@ class InferTask:
 
 class KVCache:
     def __init__(self, model):
-        self._kvcache = model.create_kv_cache()
+        self._kvcache = None  # Will be set externally
         self.tokens = [0 for _ in range(model.max_context_len())]
 
     def data(self):

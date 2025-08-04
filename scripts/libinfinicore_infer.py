@@ -112,6 +112,21 @@ def __open_library__():
         POINTER(c_float),  # float topp
         POINTER(c_uint),  # unsigned int *output
     ]
+    lib.inferBatchWithLogprobs.restype = None
+    lib.inferBatchWithLogprobs.argtypes = [
+        POINTER(JiugeModelCSruct),  # struct JiugeModel const *
+        POINTER(c_uint),  # unsigned int const *tokens
+        c_uint,  # unsigned int ntok
+        POINTER(c_uint),  # unsigned int const *req_lens
+        c_uint,  # unsigned int nreq
+        POINTER(c_uint),  # unsigned int const *req_pos
+        POINTER(POINTER(KVCacheCStruct)),  # struct KVCache **kv_caches
+        POINTER(c_float),  # float temperature
+        POINTER(c_uint),  # unsigned int topk
+        POINTER(c_float),  # float topp
+        POINTER(c_uint),  # unsigned int *output
+        POINTER(c_float),  # float *logprobs_out
+    ]
 
     return lib
 
@@ -123,3 +138,4 @@ destroy_jiuge_model = LIB.destroyJiugeModel
 create_kv_cache = LIB.createKVCache
 drop_kv_cache = LIB.dropKVCache
 infer_batch = LIB.inferBatch
+infer_batch_with_logprobs = LIB.inferBatchWithLogprobs

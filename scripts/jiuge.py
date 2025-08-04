@@ -10,6 +10,7 @@ from libinfinicore_infer import (
     create_kv_cache,
     drop_kv_cache,
     infer_batch,
+    infer_batch_with_logprobs,
 )
 from infer_task import InferTask, KVCache
 
@@ -358,7 +359,13 @@ class JiugeBatchedTask:
         token_lists = [t.tokens for t in tasks]
         self.req_lens_list = [len(toks) for toks in token_lists]
         self.req_pos_list = [t.pos for t in tasks]
-        self.kv_cache_ptrs = [t.kvcache().data() for t in tasks]
+        self.kv_cache_ptrs = []
+        for t in tasks:
+            kv = t.kvcache()
+            if hasattr(kv, 'data'):
+                self.kv_cache_ptrs.append(kv.data())
+            else:
+                self.kv_cache_ptrs.append(kv)
         self.temperaturas_list = [t.temperature for t in tasks]
         self.topks_list = [t.topk for t in tasks]
         self.topps_list = [t.topp for t in tasks]
@@ -518,7 +525,10 @@ class JiugeForCauslLM:
         return self.meta.dctx
 
     def create_kv_cache(self):
-        return create_kv_cache(self.model_instance)
+        c_kv_cache = create_kv_cache(self.model_instance)
+        kv_cache = KVCache(self)
+        kv_cache._kvcache = c_kv_cache
+        return kv_cache
 
     def drop_kv_cache(self, kv_cache):
         drop_kv_cache(self.model_instance, kv_cache)
@@ -532,6 +542,19 @@ class JiugeForCauslLM:
             output,
         )
         return list(output)
+
+    def batch_infer_one_round_with_logprobs(self, tasks: List[InferTask]):
+        """批次推理并返回 logprobs"""
+        output = (c_uint * len(tasks))()
+        logprobs_out = (c_float * (len(tasks) * self.meta.dvoc))()
+        batch_inputs = JiugeBatchedTask(tasks)
+        infer_batch_with_logprobs(
+            self.model_instance,
+            *(batch_inputs.input_args()),
+            output,
+            logprobs_out,
+        )
+        return list(output), list(logprobs_out)
 
     def generate(self, input_content, max_steps, topp_=1.0, topk_=1, temperature_=1.0):
         input_content = self.tokenizer.apply_chat_template(
@@ -550,7 +573,7 @@ class JiugeForCauslLM:
             topp_,
             self.eos_token_id,
         )
-        infer_task.bind_kvcache(KVCache(self))
+        infer_task.bind_kvcache(self.create_kv_cache())
 
         steps = 0
         total_time = 0
@@ -576,7 +599,10 @@ class JiugeForCauslLM:
                 total_time += end_time - start_time
 
         print("\n")
-        avg_time = total_time * 1000 / (steps - 1)
+        if steps > 1:
+            avg_time = total_time * 1000 / (steps - 1)
+        else:
+            avg_time = 0.0
         print(f"Time per step: {avg_time:.3f}ms")
 
         infer_task._kv_cache.drop(self)

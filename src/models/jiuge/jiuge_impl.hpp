@@ -49,6 +49,8 @@ struct InferRequest {
     const uint32_t *topk;
     const float *topp;
     uint32_t *output;
+    float *logprobs_out;
+    bool is_logprobs_request;
 };
 
 struct JiugeModel {
@@ -66,5 +68,14 @@ struct JiugeModel {
 struct KVCache {
     std::vector<std::vector<std::shared_ptr<Tensor>>> k, v;
 };
+
+// Function declarations
+void inferDeviceBatchWithLogprobs(const JiugeMeta &meta, DeviceResource &rsrc,
+                                  uint32_t idev, uint32_t ndev,
+                                  const uint32_t *tokens, uint32_t ntok,
+                                  const uint32_t *req_lens, uint32_t nreq, const uint32_t *req_pos,
+                                  struct KVCache **kv_caches,
+                                  const float *temperature, const uint32_t *topk, const float *topp,
+                                  uint32_t *output, float *logprobs_out);
 
 #endif
